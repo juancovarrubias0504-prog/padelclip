@@ -1,311 +1,206 @@
 import cv2
 import os
-import subprocess
+import time
 import threading
 from collections import deque
 from datetime import datetime
 
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
 
 # ─── CONFIGURACIÓN ────────────────────────────────────
-CAMARA = 0
-TECLA_GUARDAR = 's'
-TECLA_SALIR = 'e'
+FPS_OBJETIVO = 30
+SEGUNDOS_CLIP = 30
 
-FPS = 30
-BUFFER_SEG = 60
-MIN_FRAMES_GUARDAR = 30  # mínimo 1 segundo si FPS=30
+ANCHO_DESEADO = 1280
+ALTO_DESEADO = 720
 
-ANCHO = 1280
-ALTO = 720
-RESOLUCION = (ANCHO, ALTO)
+TECLA_GUARDAR = ord('s')
+TECLA_SALIR = ord('q')
 
-AUDIO_FS = 44100
-AUDIO_CHANNELS = 1
-AUDIO_DTYPE = 'int16'
-
-CARPETA = os.path.join(os.path.expanduser("~"), "Desktop", "padelclip")
+INDICES_CAMARA = [0, 1, 2, 3]
+BACKENDS = [
+    ("CAP_DSHOW", cv2.CAP_DSHOW),
+    ("CAP_MSMF", cv2.CAP_MSMF),
+    ("CAP_ANY", cv2.CAP_ANY),
+]
 # ──────────────────────────────────────────────────────
 
-os.makedirs(CARPETA, exist_ok=True)
 
-buffer_video = deque(maxlen=FPS * BUFFER_SEG)
-buffer_audio = deque(maxlen=AUDIO_FS * BUFFER_SEG)
+CARPETA_BASE = os.path.dirname(os.path.abspath(__file__))
+CARPETA_CLIPS = os.path.join(CARPETA_BASE, "clips")
+os.makedirs(CARPETA_CLIPS, exist_ok=True)
 
-salir = threading.Event()
 guardando = False
 lock_guardado = threading.Lock()
 
 
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(f"⚠️ Audio status: {status}")
-
-    if salir.is_set():
-        return
-
-    canal = indata[:, 0].copy()
-    buffer_audio.extend(canal.tolist())
+def formatear_tiempo(segundos):
+    horas = int(segundos // 3600)
+    minutos = int((segundos % 3600) // 60)
+    segundos_restantes = int(segundos % 60)
+    return f"{horas:02d}:{minutos:02d}:{segundos_restantes:02d}"
 
 
-def convertir_a_mp4(archivo_video_temp, archivo_audio_temp, archivo_final):
-    try:
-        import imageio_ffmpeg
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as e:
-        print(f"❌ No se pudo cargar imageio_ffmpeg: {e}")
-        return False
+def abrir_camara():
+    print("🔎 Buscando cámara disponible...")
 
-    if not ffmpeg_path:
-        print("❌ No se encontró ffmpeg.")
-        return False
+    for nombre_backend, backend in BACKENDS:
+        for indice in INDICES_CAMARA:
+            cap = cv2.VideoCapture(indice, backend)
 
-    if archivo_audio_temp and os.path.exists(archivo_audio_temp) and os.path.getsize(archivo_audio_temp) > 0:
-        comando = [
-            ffmpeg_path,
-            "-y",
-            "-i", archivo_video_temp,
-            "-i", archivo_audio_temp,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-shortest",
-            archivo_final
-        ]
-    else:
-        comando = [
-            ffmpeg_path,
-            "-y",
-            "-i", archivo_video_temp,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            archivo_final
-        ]
+            if not cap.isOpened():
+                cap.release()
+                continue
 
-    resultado = subprocess.run(comando, capture_output=True, text=True)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, ANCHO_DESEADO)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTO_DESEADO)
+            cap.set(cv2.CAP_PROP_FPS, FPS_OBJETIVO)
 
-    if resultado.returncode != 0:
-        print("❌ ffmpeg falló.")
-        print(resultado.stderr)
-        return False
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 0:
+                print(f"✅ Cámara encontrada | índice={indice} | backend={nombre_backend}")
+                return cap, indice, nombre_backend
 
-    if not os.path.exists(archivo_final):
-        print("❌ ffmpeg no generó el archivo final.")
-        return False
+            cap.release()
 
-    if os.path.getsize(archivo_final) == 0:
-        print("❌ El MP4 final quedó vacío.")
-        return False
-
-    return True
+    return None, None, None
 
 
-def guardar_clip(frames_video, frames_audio):
+def crear_writer(base_sin_extension, fps, resolucion):
+    intentos = [
+        (f"{base_sin_extension}.mp4", cv2.VideoWriter_fourcc(*"mp4v")),
+        (f"{base_sin_extension}.avi", cv2.VideoWriter_fourcc(*"XVID")),
+        (f"{base_sin_extension}.avi", cv2.VideoWriter_fourcc(*"MJPG")),
+    ]
+
+    for ruta, fourcc in intentos:
+        writer = cv2.VideoWriter(ruta, fourcc, fps, resolucion)
+        if writer.isOpened():
+            return writer, ruta
+
+    return None, None
+
+
+def guardar_clip(frames, fps_guardado):
     global guardando
 
     try:
-        cantidad_frames = len(frames_video)
-
-        if cantidad_frames < MIN_FRAMES_GUARDAR:
-            print(f"⚠️ Muy pocos frames para guardar ({cantidad_frames}).")
+        if len(frames) == 0:
+            print("❌ No hay frames para guardar.")
             return
 
-        timestamp = datetime.now().strftime("%H%M%S")
-        base = os.path.join(CARPETA, f"clip_{timestamp}")
+        primer_frame = frames[0]
+        alto, ancho = primer_frame.shape[:2]
+        resolucion = (ancho, alto)
 
-        archivo_video_temp = f"{base}_temp.avi"
-        archivo_audio_temp = f"{base}_audio.wav"
-        archivo_final = f"{base}.mp4"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(CARPETA_CLIPS, f"clip_{timestamp}")
 
-        primer_frame = frames_video[0]
-        alto_real, ancho_real = primer_frame.shape[:2]
-        resolucion_real = (ancho_real, alto_real)
-
-        print(f"💾 Guardando clip con {cantidad_frames} frames (~{cantidad_frames / FPS:.2f}s)")
-
-        writer = cv2.VideoWriter(
-            archivo_video_temp,
-            cv2.VideoWriter_fourcc(*'MJPG'),
-            FPS,
-            resolucion_real
-        )
-
-        if not writer.isOpened():
-            print("❌ No se pudo abrir el VideoWriter.")
+        writer, ruta_final = crear_writer(base, fps_guardado, resolucion)
+        if writer is None:
+            print("❌ No se pudo crear el archivo de video.")
             return
 
-        frames_escritos = 0
-        for frame in frames_video:
+        escritos = 0
+        for frame in frames:
             if frame is None:
                 continue
 
-            if len(frame.shape) != 3:
-                continue
-
-            if (frame.shape[1], frame.shape[0]) != resolucion_real:
-                frame = cv2.resize(frame, resolucion_real)
+            if frame.shape[:2] != (alto, ancho):
+                frame = cv2.resize(frame, resolucion)
 
             writer.write(frame)
-            frames_escritos += 1
+            escritos += 1
 
         writer.release()
 
-        print(f"📹 Frames escritos realmente: {frames_escritos}")
-
-        if frames_escritos == 0:
-            print("❌ No se escribió ningún frame al archivo temporal.")
-            if os.path.exists(archivo_video_temp):
-                os.remove(archivo_video_temp)
-            return
-
-        if not os.path.exists(archivo_video_temp):
-            print("❌ No se creó el archivo temporal de video.")
-            return
-
-        if os.path.getsize(archivo_video_temp) == 0:
-            print("❌ El archivo temporal de video quedó vacío.")
-            return
-
-        audio_disponible = False
-        if len(frames_audio) > 0:
-            audio_np = np.array(frames_audio, dtype=np.int16)
-            if audio_np.size > 0:
-                sf.write(archivo_audio_temp, audio_np, AUDIO_FS)
-                if os.path.exists(archivo_audio_temp) and os.path.getsize(archivo_audio_temp) > 0:
-                    audio_disponible = True
-
-        if not audio_disponible:
-            archivo_audio_temp = None
-            print("⚠️ No se pudo guardar audio válido; se exportará solo video.")
-
-        ok = convertir_a_mp4(archivo_video_temp, archivo_audio_temp, archivo_final)
-        if not ok:
-            print("⚠️ Conversión fallida. Te dejo los temporales para revisar:")
-            print(f"   {archivo_video_temp}")
-            if archivo_audio_temp:
-                print(f"   {archivo_audio_temp}")
-            return
-
-        print(f"✅ Clip final guardado correctamente: {archivo_final}")
-
-        try:
-            if os.path.exists(archivo_video_temp):
-                os.remove(archivo_video_temp)
-        except OSError:
-            pass
-
-        if archivo_audio_temp:
-            try:
-                if os.path.exists(archivo_audio_temp):
-                    os.remove(archivo_audio_temp)
-            except OSError:
-                pass
+        duracion = escritos / fps_guardado if fps_guardado > 0 else 0
+        print(f"✅ Clip guardado: {ruta_final}")
+        print(f"📹 Frames escritos: {escritos} | duración aprox: {duracion:.2f}s")
 
     finally:
         with lock_guardado:
             guardando = False
 
 
-cam = cv2.VideoCapture(CAMARA)
-cam.set(cv2.CAP_PROP_FRAME_WIDTH, ANCHO)
-cam.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTO)
-cam.set(cv2.CAP_PROP_FPS, FPS)
+cap, indice_camara, backend_usado = abrir_camara()
 
-if not cam.isOpened():
-    print("❌ No se pudo abrir la cámara. Verifica CAMARA = 0 o 1")
+if cap is None:
+    print("❌ No se pudo abrir ninguna cámara.")
     raise SystemExit
 
-try:
-    stream_audio = sd.InputStream(
-        samplerate=AUDIO_FS,
-        channels=AUDIO_CHANNELS,
-        dtype=AUDIO_DTYPE,
-        callback=audio_callback
-    )
-    stream_audio.start()
-    audio_activo = True
-except Exception as e:
-    print(f"⚠️ No se pudo iniciar el micrófono: {e}")
-    stream_audio = None
-    audio_activo = False
+fps_real = cap.get(cv2.CAP_PROP_FPS)
+if fps_real is None or fps_real <= 1 or fps_real > 120:
+    fps_real = FPS_OBJETIVO
 
-print("🎥 Cámara activa. Buffer grabando...")
-print(f"🎙️ Micrófono activo: {'sí' if audio_activo else 'no'}")
-print(f"⌨️ Presiona '{TECLA_GUARDAR.upper()}' para guardar el buffer actual")
-print(f"⌨️ Presiona '{TECLA_SALIR.upper()}' para salir de inmediato")
+FPS_USADO = int(round(fps_real))
+MAX_FRAMES_BUFFER = FPS_USADO * SEGUNDOS_CLIP
+buffer_frames = deque(maxlen=MAX_FRAMES_BUFFER)
 
-while not salir.is_set():
-    ret, frame = cam.read()
-    if not ret:
-        print("❌ Error leyendo la cámara")
-        break
+tiempo_inicio = time.time()
 
-    frame = cv2.resize(frame, RESOLUCION)
-    buffer_video.append(frame.copy())
+print("🎥 Cámara activa")
+print(f"📷 Índice cámara: {indice_camara}")
+print(f"🧩 Backend: {backend_usado}")
+print(f"🎞️ FPS usado: {FPS_USADO}")
+print(f"💾 Carpeta de clips: {CARPETA_CLIPS}")
+print("⌨️ S = guardar últimos 30 segundos")
+print("⌨️ Q = salir")
 
-    seg_video = len(buffer_video) / FPS
-    seg_audio = len(buffer_audio) / AUDIO_FS if len(buffer_audio) > 0 else 0.0
-    seg_mostrados = seg_video if not audio_activo else min(seg_video, seg_audio)
+while True:
+    ok, frame = cap.read()
 
-    texto = (
-        f"Buffer: {seg_mostrados:.1f}s | "
-        f"[{TECLA_GUARDAR.upper()}] Guardar | "
-        f"[{TECLA_SALIR.upper()}] Salir"
-    )
+    if not ok or frame is None or frame.size == 0:
+        print("⚠️ No se pudo leer un frame de la cámara.")
+        time.sleep(0.01)
+        continue
 
-    cv2.putText(
-        frame,
-        texto,
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 100),
-        2
-    )
+    buffer_frames.append(frame.copy())
 
-    cv2.imshow("PadelClip MVP", frame)
+    tiempo_total = time.time() - tiempo_inicio
+    segundos_en_buffer = len(buffer_frames) / FPS_USADO
 
-    key = cv2.waitKey(1) & 0xFF
+    overlay = frame.copy()
 
-    if key == ord(TECLA_GUARDAR):
+    texto_1 = f"Tiempo corriendo: {formatear_tiempo(tiempo_total)}"
+    texto_2 = f"Buffer: {segundos_en_buffer:05.1f}s / {SEGUNDOS_CLIP}s"
+    texto_3 = "[S] Guardar clip | [Q] Salir"
+
+    cv2.putText(overlay, texto_1, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+    cv2.putText(overlay, texto_2, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+    cv2.putText(overlay, texto_3, (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+
+    if segundos_en_buffer < SEGUNDOS_CLIP:
+        faltan = SEGUNDOS_CLIP - segundos_en_buffer
+        texto_4 = f"Aun faltan {faltan:.1f}s para poder guardar un clip completo"
+        cv2.putText(overlay, texto_4, (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+
+    cv2.imshow("PadelClip - Instant Replay", overlay)
+    tecla = cv2.waitKey(1) & 0xFF
+
+    if tecla == TECLA_GUARDAR:
+        if len(buffer_frames) < MAX_FRAMES_BUFFER:
+            print("⚠️ Todavía no hay 30 segundos completos en el buffer.")
+            continue
+
         with lock_guardado:
             if guardando:
-                print("⏳ Ya hay un guardado en curso.")
+                print("⏳ Ya se está guardando un clip.")
                 continue
             guardando = True
 
-        frames_video = list(buffer_video)
-        frames_audio = list(buffer_audio)
-
-        if len(frames_video) < MIN_FRAMES_GUARDAR:
-            print(f"⚠️ Aún no hay suficiente buffer. Frames actuales: {len(frames_video)}")
-            with lock_guardado:
-                guardando = False
-            continue
+        frames_a_guardar = list(buffer_frames)
 
         hilo = threading.Thread(
             target=guardar_clip,
-            args=(frames_video, frames_audio),
+            args=(frames_a_guardar, FPS_USADO),
             daemon=True
         )
         hilo.start()
 
-    elif key == ord(TECLA_SALIR) or key == ord('q'):
-        print(f"\n🛑 Tecla '{TECLA_SALIR.upper()}' presionada — cerrando...")
-        salir.set()
+    elif tecla == TECLA_SALIR:
+        print("🛑 Cerrando programa...")
         break
 
-cam.release()
+cap.release()
 cv2.destroyAllWindows()
-
-if stream_audio is not None:
-    try:
-        stream_audio.stop()
-        stream_audio.close()
-    except Exception:
-        pass
-
-print("👋 Programa cerrado")
+print("👋 Programa cerrado.")
